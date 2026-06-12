@@ -136,7 +136,8 @@ export class SSHSession {
         blockSize,
         this.decryptCipher
           ? (data, seq) => this.decryptCipher!.decrypt(data, seq) as any
-          : (data) => data
+          : (data) => data,
+        !!this.decryptCipher  // hasAuthTag: true when encryption is enabled
       );
 
       if (!packet) break;

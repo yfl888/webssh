@@ -14,7 +14,7 @@ export class SSHPacketParser {
 
   nextPacket(blockSize: number, decrypt: (
     data: Uint8Array, seq: number
-  ) => Uint8Array | null): SSHPacket | null {
+  ) => Uint8Array | null, hasAuthTag: boolean = false): SSHPacket | null {
     if (this.buffer.length < blockSize) return null;
 
     const header = decrypt(
@@ -28,7 +28,8 @@ export class SSHPacketParser {
     const totalBlocks = Math.ceil((4 + packetLength) / blockSize);
     const totalSize = totalBlocks * blockSize;
 
-    const expectedSize = totalSize + 16;
+    // GCM 模式有 16 字节 auth tag，普通模式没有
+    const expectedSize = hasAuthTag ? totalSize + 16 : totalSize;
 
     if (this.buffer.length < expectedSize) return null;
 
@@ -47,7 +48,7 @@ export class SSHPacketParser {
       length: packetLength,
       paddingLength,
       payload,
-      mac: encryptedPacket.slice(totalSize),
+      mac: hasAuthTag ? encryptedPacket.slice(totalSize) : undefined,
     };
   }
 
