@@ -7,6 +7,8 @@ import {
   SSH_MSG_SERVICE_ACCEPT,
   SSH_MSG_USERAUTH_SUCCESS,
   SSH_MSG_USERAUTH_FAILURE,
+  SSH_MSG_GLOBAL_REQUEST,
+  SSH_MSG_REQUEST_FAILURE,
   SSH_MSG_CHANNEL_OPEN_CONFIRMATION,
   SSH_MSG_CHANNEL_SUCCESS,
   SSH_MSG_CHANNEL_FAILURE,
@@ -174,9 +176,9 @@ export class SSHSession {
       }
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      console.error('[SSH] Read loop error:', errMsg);
+      console.error('[SSH] Read loop error:', errMsg, error instanceof Error ? error.stack : '');
       try {
-        this.ws.send(JSON.stringify({ type: 'error', message: 'SSH 连接断开: ' + errMsg }));
+        this.ws.send(JSON.stringify({ type: 'error', message: 'SSH 连接异常: ' + errMsg }));
       } catch {}
     }
   }
@@ -210,29 +212,52 @@ export class SSHSession {
 
   private async processPackets(): Promise<void> {
     const blockSize = this.decryptCipher ? 16 : 8;
-    console.log('[PKT] processPackets: blockSize=' + blockSize + ', hasDecrypt=' + !!this.decryptCipher + ', bufferLen=' + this.packetParser.getBufferLength());
+    const hasDecrypt = !!this.decryptCipher;
+    this.sendDebug(`processPackets: blockSize=${blockSize}, hasDecrypt=${hasDecrypt}, bufferLen=${this.packetParser.getBufferLength()}`);
 
     while (true) {
-      const packet = await this.packetParser.nextPacket(
-        blockSize,
-        this.decryptCipher
-          ? (data, seq, aad) => this.decryptCipher!.decrypt(data, seq, aad)
-          : (data) => data,
-        !!this.decryptCipher
-      );
+      try {
+        const packet = await this.packetParser.nextPacket(
+          blockSize,
+          this.decryptCipher
+            ? (data, seq, aad) => this.decryptCipher!.decrypt(data, seq, aad)
+            : (data) => data,
+          !!this.decryptCipher
+        );
 
-      if (!packet) {
-        console.log('[PKT] No more packets, buffer remaining: ' + this.packetParser.getBufferLength());
-        break;
+        if (!packet) {
+          this.sendDebug(`No more packets, buffer remaining: ${this.packetParser.getBufferLength()}`);
+          break;
+        }
+
+        this.sendDebug(`Received msgType=${packet.payload[0]}, state=${this.state}, payloadLen=${packet.payload.length}`);
+        await this.handlePacket(packet);
+      } catch (e) {
+        const errMsg = e instanceof Error ? e.message : String(e);
+        this.sendDebug(`processPackets ERROR: ${errMsg}`);
+        this.sendError('数据包处理异常: ' + errMsg);
+        this.close();
+        return;
       }
-
-      console.log('[PKT] Received msgType=' + packet.payload[0] + ', state=' + this.state + ', payloadLen=' + packet.payload.length);
-      await this.handlePacket(packet);
     }
   }
 
   private async handlePacket(packet: any): Promise<void> {
     const msgType = packet.payload[0];
+
+    // Transport-level messages handled regardless of state
+    if (msgType === SSH_MSG_DISCONNECT) {
+      this.sendStatus('服务器断开连接');
+      this.close();
+      return;
+    }
+    if (msgType === SSH_MSG_IGNORE || msgType === SSH_MSG_DEBUG || msgType === SSH_MSG_UNIMPLEMENTED) {
+      return;
+    }
+    if (msgType === SSH_MSG_GLOBAL_REQUEST) {
+      await this.handleGlobalRequest(packet.payload);
+      return;
+    }
 
     switch (this.state) {
       case 'kex':
@@ -250,21 +275,43 @@ export class SSHSession {
     }
   }
 
+  private async handleGlobalRequest(payload: Uint8Array): Promise<void> {
+    // SSH_MSG_GLOBAL_REQUEST format:
+    //   byte      SSH_MSG_GLOBAL_REQUEST (80)
+    //   string    request_name
+    //   boolean   want_reply
+    //   ...       request-specific data
+    let offset = 1;
+    const nameLen = (payload[offset] << 24) | (payload[offset+1] << 16) |
+                    (payload[offset+2] << 8) | payload[offset+3];
+    offset += 4;
+    const requestName = new TextDecoder().decode(payload.slice(offset, offset + nameLen));
+    offset += nameLen;
+    const wantReply = payload[offset] !== 0;
+
+    this.sendDebug(`Global request: ${requestName}, wantReply=${wantReply}`);
+
+    if (wantReply) {
+      // Reply with SSH_MSG_REQUEST_FAILURE (we don't support any global requests)
+      const reply = new Uint8Array([SSH_MSG_REQUEST_FAILURE]);
+      await this.sendEncrypted(reply);
+    }
+  }
+
   private async handleKEXPacket(msgType: number, payload: Uint8Array): Promise<void> {
-    console.log('[KEX] handleKEXPacket: msgType=' + msgType);
+    this.sendDebug(`handleKEXPacket: msgType=${msgType}`);
     switch (msgType) {
       case SSH_MSG_KEXINIT: {
         this.kexInitRemote = payload;
-        console.log('[KEX] Received KEXINIT from server');
+        this.sendDebug('Received KEXINIT from server');
         try {
           const serverKex = parseKEXInit(payload);
           const clientKex = parseKEXInit(this.kexInitLocal!);
           this.negotiatedCipherC2S = negotiate(clientKex.encryptionC2S, serverKex.encryptionC2S);
           this.negotiatedCipherS2C = negotiate(clientKex.encryptionS2C, serverKex.encryptionS2C);
-          console.log(`[KEX] Negotiated Cipher C2S: ${this.negotiatedCipherC2S}, S2C: ${this.negotiatedCipherS2C}`);
+          this.sendDebug(`Negotiated C2S: ${this.negotiatedCipherC2S}, S2C: ${this.negotiatedCipherS2C}`);
         } catch (e) {
           const errMsg = e instanceof Error ? e.message : String(e);
-          console.error('[KEX] Algorithm negotiation failed:', errMsg);
           this.sendError('算法协商失败: ' + errMsg);
           this.close();
         }
@@ -272,65 +319,56 @@ export class SSHSession {
       }
 
       case SSH_MSG_KEX_ECDH_REPLY:
-        console.log('[KEX] Received ECDH_REPLY');
+        this.sendDebug('Received ECDH_REPLY');
         await this.handleECDHReply(payload);
         break;
 
       case SSH_MSG_NEWKEYS: {
-        console.log('[KEX] Received NEWKEYS from server, seqNumSend=' + this.seqNumSend);
+        this.sendDebug(`Received NEWKEYS, seqNumSend=${this.seqNumSend}`);
         const newKeys = new Uint8Array([SSH_MSG_NEWKEYS]);
         const packet = await SSHPacketBuilder.build(
           newKeys, 8, null, this.seqNumSend++
         );
         await this.writeSocket(packet);
-        console.log('[KEX] Client NEWKEYS sent, seqNumSend=' + this.seqNumSend);
+        this.sendDebug(`Client NEWKEYS sent, seqNumSend=${this.seqNumSend}`);
 
         await this.enableEncryption();
-        console.log('[KEX] Encryption enabled');
+        this.sendDebug('Encryption enabled');
         this.state = 'auth';
         try {
           await this.sendServiceRequest();
-          console.log('[AUTH] SERVICE_REQUEST sent');
+          this.sendDebug('SERVICE_REQUEST sent successfully');
         } catch (e) {
           const errMsg = e instanceof Error ? e.message : String(e);
-          console.error('[AUTH] SERVICE_REQUEST failed:', errMsg);
-          this.sendError('密钥协商失败: ' + errMsg);
+          this.sendDebug(`SERVICE_REQUEST failed: ${errMsg}`);
+          this.sendError('SERVICE_REQUEST 失败: ' + errMsg);
           this.close();
         }
         break;
       }
 
       case SSH_MSG_UNIMPLEMENTED:
-        console.warn('[KEX] Server sent UNIMPLEMENTED');
+        this.sendDebug('Server sent UNIMPLEMENTED');
         break;
 
       default:
-        console.warn('[KEX] Unexpected msgType=' + msgType + ' in kex state');
+        this.sendDebug(`Unexpected msgType=${msgType} in kex state`);
         break;
     }
   }
 
   private async handleECDHReply(payload: Uint8Array): Promise<void> {
-    console.log('[KEX] Parsing ECDH_REPLY...');
+    this.sendDebug('Parsing ECDH_REPLY...');
     const { hostKey, serverRawPublicKey, signature } =
       ECDHKeyExchange.parseReply(payload);
-    console.log('[KEX] ECDH_REPLY parsed: hostKey=' + hostKey.length + ', serverPubKey=' + serverRawPublicKey.length + ', sig=' + signature.length);
+    this.sendDebug(`ECDH_REPLY parsed: hostKey=${hostKey.length}, serverPubKey=${serverRawPublicKey.length}, sig=${signature.length}`);
 
-    console.log('[KEX] Computing shared secret...');
     const sharedSecret = await ECDHKeyExchange.computeSharedSecret(
       this.ecdhKeyPair.privateKey,
       serverRawPublicKey
     );
-    console.log('[KEX] Shared secret computed: ' + sharedSecret.length + ' bytes');
+    this.sendDebug(`Shared secret: ${sharedSecret.length} bytes`);
 
-    console.log('[KEX] Computing exchange hash...');
-    const localVer = this.transport.getLocalVersion();
-    const remoteVer = this.transport.getRemoteVersion();
-    console.log('[KEX] localVer="' + localVer + '" len=' + localVer.length);
-    console.log('[KEX] remoteVer="' + remoteVer + '" len=' + remoteVer.length);
-    console.log('[KEX] kexInitLocal len=' + this.kexInitLocal!.length + ' kexInitRemote len=' + this.kexInitRemote!.length);
-    console.log('[KEX] hostKey len=' + hostKey.length + ' clientPubKey len=' + this.ecdhRawPublicKey.length + ' serverPubKey len=' + serverRawPublicKey.length);
-    console.log('[KEX] sharedSecret len=' + sharedSecret.length);
     const H = await ECDHKeyExchange.computeExchangeHash(
       this.transport.getLocalVersion(),
       this.transport.getRemoteVersion(),
@@ -341,21 +379,135 @@ export class SSHSession {
       serverRawPublicKey,
       sharedSecret
     );
-    console.log('[KEX] Exchange hash hex=' + Array.from(H).map(b => b.toString(16).padStart(2, '0')).join(''));
-    console.log('[KEX] sharedSecret hex=' + Array.from(sharedSecret).map(b => b.toString(16).padStart(2, '0')).join(''));
-    console.log('[KEX] hostKey hex=' + Array.from(hostKey).map(b => b.toString(16).padStart(2, '0')).join(''));
-    console.log('[KEX] signature hex=' + Array.from(signature).map(b => b.toString(16).padStart(2, '0')).join(''));
-    console.log('[KEX] clientPubKey hex=' + Array.from(this.ecdhRawPublicKey).map(b => b.toString(16).padStart(2, '0')).join(''));
-    console.log('[KEX] serverPubKey hex=' + Array.from(serverRawPublicKey).map(b => b.toString(16).padStart(2, '0')).join(''));
+    const hHex = Array.from(H).map(b => b.toString(16).padStart(2, '0')).join('');
+    this.sendDebug(`Exchange hash H=${hHex}`);
+
+    // Verify host key signature to confirm exchange hash is correct
+    try {
+      const sigVerified = await this.verifyHostKeySignature(hostKey, signature, H);
+      this.sendDebug(`Host key signature verification: ${sigVerified ? 'PASS' : 'FAIL'}`);
+      if (!sigVerified) {
+        this.sendError('主机密钥签名验证失败 - Exchange Hash 计算可能有误');
+      }
+    } catch (e) {
+      const errMsg = e instanceof Error ? e.message : String(e);
+      this.sendDebug(`Signature verification error: ${errMsg}`);
+    }
 
     if (!this.sessionID) {
       this.sessionID = H;
-      console.log('[KEX] Session ID set');
+      this.sendDebug('Session ID set');
     }
 
-    console.log('[KEX] Deriving keys...');
     this.derivedKeys = await KeyDerivation.deriveKeys(sharedSecret, H, this.sessionID!);
-    console.log('[KEX] Keys derived, waiting for NEWKEYS');
+    this.sendDebug('Keys derived, waiting for NEWKEYS');
+  }
+
+  private async verifyHostKeySignature(
+    hostKeyBlob: Uint8Array,
+    signatureBlob: Uint8Array,
+    exchangeHash: Uint8Array
+  ): Promise<boolean> {
+    // Parse host key blob to get key type and raw key
+    let offset = 0;
+    const keyTypeLen = (hostKeyBlob[offset] << 24) | (hostKeyBlob[offset+1] << 16) |
+                       (hostKeyBlob[offset+2] << 8) | hostKeyBlob[offset+3];
+    offset += 4;
+    const keyType = new TextDecoder().decode(hostKeyBlob.slice(offset, offset + keyTypeLen));
+    offset += keyTypeLen;
+    this.sendDebug(`Host key type: ${keyType}`);
+
+    // Parse signature blob to get sig type and raw sig
+    let sigOffset = 0;
+    const sigTypeLen = (signatureBlob[sigOffset] << 24) | (signatureBlob[sigOffset+1] << 16) |
+                       (signatureBlob[sigOffset+2] << 8) | signatureBlob[sigOffset+3];
+    sigOffset += 4;
+    const sigType = new TextDecoder().decode(signatureBlob.slice(sigOffset, sigOffset + sigTypeLen));
+    sigOffset += sigTypeLen;
+    const rawSigLen = (signatureBlob[sigOffset] << 24) | (signatureBlob[sigOffset+1] << 16) |
+                      (signatureBlob[sigOffset+2] << 8) | signatureBlob[sigOffset+3];
+    sigOffset += 4;
+    const rawSig = signatureBlob.slice(sigOffset, sigOffset + rawSigLen);
+    this.sendDebug(`Signature type: ${sigType}, raw sig len: ${rawSig.length}`);
+
+    if (keyType === 'ssh-ed25519') {
+      const rawKeyLen = (hostKeyBlob[offset] << 24) | (hostKeyBlob[offset+1] << 16) |
+                        (hostKeyBlob[offset+2] << 8) | hostKeyBlob[offset+3];
+      offset += 4;
+      const rawKey = hostKeyBlob.slice(offset, offset + rawKeyLen);
+      this.sendDebug(`Ed25519 public key: ${rawKey.length} bytes`);
+
+      const pubKey = await crypto.subtle.importKey(
+        'raw',
+        rawKey,
+        { name: 'Ed25519' },
+        false,
+        ['verify']
+      );
+
+      return await crypto.subtle.verify(
+        'Ed25519',
+        pubKey,
+        rawSig,
+        exchangeHash
+      );
+    } else if (keyType === 'ecdsa-sha2-nistp256') {
+      // Parse ECDSA key
+      const curveLen = (hostKeyBlob[offset] << 24) | (hostKeyBlob[offset+1] << 16) |
+                       (hostKeyBlob[offset+2] << 8) | hostKeyBlob[offset+3];
+      offset += 4 + curveLen;
+      const rawKeyLen = (hostKeyBlob[offset] << 24) | (hostKeyBlob[offset+1] << 16) |
+                        (hostKeyBlob[offset+2] << 8) | hostKeyBlob[offset+3];
+      offset += 4;
+      const rawKey = hostKeyBlob.slice(offset, offset + rawKeyLen);
+      this.sendDebug(`ECDSA public key: ${rawKey.length} bytes`);
+
+      const pubKey = await crypto.subtle.importKey(
+        'raw',
+        rawKey,
+        { name: 'ECDSA', namedCurve: 'P-256' },
+        false,
+        ['verify']
+      );
+
+      // Convert SSH DER signature to raw r||s format for Web Crypto
+      const ecdsaRawSig = this.convertSSHECDSASig(rawSig);
+      this.sendDebug(`ECDSA raw sig: ${ecdsaRawSig.length} bytes`);
+
+      return await crypto.subtle.verify(
+        { name: 'ECDSA', hash: 'SHA-256' },
+        pubKey,
+        ecdsaRawSig,
+        exchangeHash
+      );
+    }
+
+    this.sendDebug(`Unsupported key type for verification: ${keyType}`);
+    return false;
+  }
+
+  private convertSSHECDSASig(sshSig: Uint8Array): Uint8Array {
+    // SSH ECDSA sig is: string r, string s (each mpint)
+    let offset = 0;
+    const rLen = (sshSig[offset] << 24) | (sshSig[offset+1] << 16) |
+                 (sshSig[offset+2] << 8) | sshSig[offset+3];
+    offset += 4;
+    let r = sshSig.slice(offset, offset + rLen);
+    offset += rLen;
+    const sLen = (sshSig[offset] << 24) | (sshSig[offset+1] << 16) |
+                 (sshSig[offset+2] << 8) | sshSig[offset+3];
+    offset += 4;
+    let s = sshSig.slice(offset, offset + sLen);
+
+    // Strip leading zero bytes (mpint sign extension)
+    if (r.length > 32 && r[0] === 0) r = r.slice(1);
+    if (s.length > 32 && s[0] === 0) s = s.slice(1);
+
+    // Pad to 32 bytes each
+    const result = new Uint8Array(64);
+    result.set(r, 32 - r.length);
+    result.set(s, 64 - s.length);
+    return result;
   }
 
   private async enableEncryption(): Promise<void> {
@@ -370,11 +522,11 @@ export class SSHSession {
       encKeyS2C = encKeyS2C.slice(0, 16);
     }
 
-    console.log('[KEX] encKeyC2S len=' + encKeyC2S.length + ', ivC2S len=' + keys.ivClientToServer.length);
-    console.log('[KEX] ivC2S hex=' + Array.from(keys.ivClientToServer).map(b => b.toString(16).padStart(2, '0')).join(''));
-    console.log('[KEX] encKeyC2S hex=' + Array.from(encKeyC2S).map(b => b.toString(16).padStart(2, '0')).join(''));
-    console.log('[KEX] ivS2C hex=' + Array.from(keys.ivServerToClient).map(b => b.toString(16).padStart(2, '0')).join(''));
-    console.log('[KEX] encKeyS2C hex=' + Array.from(encKeyS2C).map(b => b.toString(16).padStart(2, '0')).join(''));
+    const toHex = (a: Uint8Array) => Array.from(a).map(b => b.toString(16).padStart(2, '0')).join('');
+    this.sendDebug(`ivC2S=${toHex(keys.ivClientToServer)}`);
+    this.sendDebug(`encKeyC2S=${toHex(encKeyC2S)}`);
+    this.sendDebug(`ivS2C=${toHex(keys.ivServerToClient)}`);
+    this.sendDebug(`encKeyS2C=${toHex(encKeyS2C)}`);
 
     this.encryptCipher = new SSHAESGCMCipher(
       encKeyC2S,
@@ -388,17 +540,7 @@ export class SSHSession {
     );
     await this.decryptCipher.init();
 
-    try {
-      const testPlain = new Uint8Array([0x48, 0x65, 0x6c, 0x6c, 0x6f]);
-      const testAad = new Uint8Array([0, 0, 0, 5]);
-      const testEnc = await this.encryptCipher.encrypt(testPlain, 0, testAad);
-      console.log('[KEX] Round-trip test: encrypted ' + testPlain.length + ' -> ' + testEnc.length + ' bytes');
-      const testDec = await this.encryptCipher.decrypt(testEnc, 0, testAad);
-      const match = testDec && testDec.length === testPlain.length && testDec.every((b, i) => b === testPlain[i]);
-      console.log('[KEX] Round-trip test: ' + (match ? 'PASS' : 'FAIL'));
-    } catch (e) {
-      console.error('[KEX] Round-trip test ERROR:', e instanceof Error ? e.message : String(e));
-    }
+    this.sendDebug('Ciphers initialized');
   }
 
   private async sendServiceRequest(): Promise<void> {
@@ -578,6 +720,13 @@ export class SSHSession {
     try {
       this.ws.send(JSON.stringify({ type: 'error', message }));
     } catch {}
+  }
+
+  private sendDebug(message: string): void {
+    // console.log('[DEBUG] ' + message);
+    // try {
+    //   this.ws.send(JSON.stringify({ type: 'status', message: '[DEBUG] ' + message }));
+    // } catch {}
   }
 
   close(): void {

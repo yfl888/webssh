@@ -98,7 +98,14 @@ export class SSHPacketBuilder {
     hasAuthTag: boolean = false
   ): Promise<Uint8Array> {
     const packetLength = 1 + payload.length;
-    const paddingNeeded = blockSize - ((4 + packetLength) % blockSize);
+    // For AES-GCM (hasAuthTag), padding aligns the encrypted portion
+    // (padding_length + payload + padding) to blockSize.
+    // The 4-byte packet_length is AAD, NOT part of the encrypted data.
+    // For non-GCM, padding aligns the full packet (4 + data) to blockSize.
+    const alignBase = hasAuthTag
+      ? (1 + payload.length) % blockSize      // encrypted portion only
+      : (4 + packetLength) % blockSize;        // full packet including length
+    const paddingNeeded = blockSize - (alignBase || blockSize);
     const paddingLength = paddingNeeded < 4
       ? paddingNeeded + blockSize
       : paddingNeeded;

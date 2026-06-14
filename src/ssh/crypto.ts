@@ -1,11 +1,11 @@
 export class SSHAESGCMCipher {
   private key: CryptoKey | null = null;
-  private baseIV: Uint8Array;
-  private seqNum: number = 0;
+  private iv: Uint8Array;
   private rawKey: Uint8Array;
 
   constructor(rawKey: Uint8Array, iv: Uint8Array) {
-    this.baseIV = iv;
+    // Copy the IV so we own it; this is the mutable nonce state
+    this.iv = new Uint8Array(iv);
     this.rawKey = rawKey;
   }
 
@@ -19,20 +19,22 @@ export class SSHAESGCMCipher {
     );
   }
 
-  private buildNonce(seqNum: number): Uint8Array {
-    const nonce = new Uint8Array(this.baseIV);
-    nonce[8] ^= (seqNum >>> 24) & 0xff;
-    nonce[9] ^= (seqNum >>> 16) & 0xff;
-    nonce[10] ^= (seqNum >>> 8) & 0xff;
-    nonce[11] ^= seqNum & 0xff;
-    console.log('[CRYPTO] buildNonce: seqNum=' + seqNum + ', nonce=' + Array.from(nonce).map(b => b.toString(16).padStart(2, '0')).join(''));
-    return nonce;
+  /**
+   * Increment the 64-bit invocation counter stored in IV bytes [4..11]
+   * using big-endian carry-over logic, per RFC 5647 §7.1.
+   */
+  private incIV(): void {
+    for (let i = 11; i >= 4; i--) {
+      this.iv[i]++;
+      if (this.iv[i] !== 0) {
+        break;
+      }
+    }
   }
 
-  async encrypt(plaintext: Uint8Array, seqNum?: number, aad?: Uint8Array): Promise<Uint8Array> {
+  async encrypt(plaintext: Uint8Array, _seqNum?: number, aad?: Uint8Array): Promise<Uint8Array> {
     if (!this.key) throw new Error('Cipher not initialized');
-    const seq = seqNum ?? this.seqNum++;
-    const nonce = this.buildNonce(seq);
+    const nonce = new Uint8Array(this.iv);
 
     const alg: Record<string, unknown> = { name: 'AES-GCM', iv: nonce, tagLength: 128 };
     if (aad) alg.additionalData = aad;
@@ -41,13 +43,13 @@ export class SSHAESGCMCipher {
       await crypto.subtle.encrypt(alg as AesGcmParams, this.key, plaintext)
     );
 
+    this.incIV();
     return encrypted;
   }
 
-  async decrypt(ciphertext: Uint8Array, seqNum?: number, aad?: Uint8Array): Promise<Uint8Array | null> {
+  async decrypt(ciphertext: Uint8Array, _seqNum?: number, aad?: Uint8Array): Promise<Uint8Array | null> {
     if (!this.key) throw new Error('Cipher not initialized');
-    const seq = seqNum ?? this.seqNum++;
-    const nonce = this.buildNonce(seq);
+    const nonce = new Uint8Array(this.iv);
 
     const alg: Record<string, unknown> = { name: 'AES-GCM', iv: nonce, tagLength: 128 };
     if (aad) alg.additionalData = aad;
@@ -56,9 +58,10 @@ export class SSHAESGCMCipher {
       const decrypted = new Uint8Array(
         await crypto.subtle.decrypt(alg as AesGcmParams, this.key, ciphertext)
       );
+      this.incIV();
       return decrypted;
     } catch (e) {
-      console.error('[CRYPTO] Decrypt failed, seqNum:', seq, 'ciphertextLen:', ciphertext.length, 'error:', e instanceof Error ? e.message : String(e));
+      console.error('[CRYPTO] Decrypt failed, ciphertextLen:', ciphertext.length, 'error:', e instanceof Error ? e.message : String(e));
       return null;
     }
   }

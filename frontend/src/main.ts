@@ -12,3 +12,9 @@ document.getElementById('disconnect-btn')?.addEventListener('click', () => {
   document.getElementById('auth-section')!.classList.remove('hidden');
   document.getElementById('status-text')!.innerHTML = '<span class="w-2 h-2 bg-[#353534] inline-block"></span> STATUS: OFFLINE';
 });
+
+// Set current year for copyright
+const copyrightYearSpan = document.getElementById('copyright-year');
+if (copyrightYearSpan) {
+  copyrightYearSpan.textContent = new Date().getFullYear().toString();
+}
