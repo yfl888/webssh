@@ -9,6 +9,7 @@ import {
   SSH_MSG_USERAUTH_FAILURE,
   SSH_MSG_GLOBAL_REQUEST,
   SSH_MSG_REQUEST_FAILURE,
+  SSH_MSG_REQUEST_SUCCESS,
   SSH_MSG_CHANNEL_OPEN_CONFIRMATION,
   SSH_MSG_CHANNEL_SUCCESS,
   SSH_MSG_CHANNEL_FAILURE,
@@ -69,6 +70,8 @@ export class SSHSession {
   private versionRawBuffer: Uint8Array = new Uint8Array(0);
   private negotiatedCipherC2S: string = 'aes256-gcm@openssh.com';
   private negotiatedCipherS2C: string = 'aes256-gcm@openssh.com';
+
+  private keepaliveInterval: ReturnType<typeof setInterval> | null = null;
 
   constructor(
     ws: WebSocket,
@@ -298,11 +301,29 @@ export class SSHSession {
 
     this.sendDebug(`Global request: ${requestName}, wantReply=${wantReply}`);
 
+    if (requestName === 'keepalive@openssh.com') {
+      if (wantReply) {
+        const reply = new Uint8Array([SSH_MSG_REQUEST_SUCCESS]);
+        await this.sendEncrypted(reply);
+      }
+      return;
+    }
+
     if (wantReply) {
-      // Reply with SSH_MSG_REQUEST_FAILURE (we don't support any global requests)
       const reply = new Uint8Array([SSH_MSG_REQUEST_FAILURE]);
       await this.sendEncrypted(reply);
     }
+  }
+
+  private startKeepalive(): void {
+    this.keepaliveInterval = setInterval(async () => {
+      try {
+        const ignoreMsg = new Uint8Array([SSH_MSG_IGNORE, 0, 0, 0, 0]);
+        await this.sendEncrypted(ignoreMsg);
+      } catch (e) {
+        this.sendDebug('Keepalive send failed: ' + (e instanceof Error ? e.message : String(e)));
+      }
+    }, 25000);
   }
 
   private async handleKEXPacket(msgType: number, payload: Uint8Array): Promise<void> {
@@ -683,6 +704,7 @@ export class SSHSession {
       case SSH_MSG_USERAUTH_SUCCESS:
         this.sendStatus('认证成功');
         this.state = 'shell';
+        this.startKeepalive();
         await this.openShell();
         break;
 
@@ -764,6 +786,11 @@ export class SSHSession {
     if (this.state !== 'ready') return;
 
     if (typeof data === 'string') {
+      if (data === '{"type":"ping"}') {
+        this.ws.send(JSON.stringify({ type: 'pong' }));
+        return;
+      }
+      
       if (data.startsWith('{"type":"resize"')) {
         try {
           const msg = JSON.parse(data);
@@ -827,6 +854,10 @@ export class SSHSession {
   }
 
   close(): void {
+    if (this.keepaliveInterval) {
+      clearInterval(this.keepaliveInterval);
+      this.keepaliveInterval = null;
+    }
     try { this.socket.close(); } catch {}
     try { this.ws.close(); } catch {}
   }

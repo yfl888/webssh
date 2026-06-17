@@ -45,6 +45,11 @@ export class SSHTerminal {
   private ws: WebSocket | null = null;
   private container: HTMLElement;
   private disposables: { dispose(): void }[] = [];
+  private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
+  private reconnectAttempts: number = 0;
+  private maxReconnectAttempts: number = 5;
+  private reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+  private lastConfig: SSHConnectionConfig | null = null;
 
   constructor(containerId: string) {
     this.container = document.getElementById(containerId)!;
@@ -107,6 +112,7 @@ export class SSHTerminal {
   }
 
   async connect(config: SSHConnectionConfig): Promise<void> {
+    this.lastConfig = config;
     const wsUrl = new URL(window.location.href);
     wsUrl.protocol = wsUrl.protocol === 'https:' ? 'wss:' : 'ws:';
     wsUrl.pathname = '/api/ssh';
@@ -125,6 +131,8 @@ export class SSHTerminal {
           privateKey: config.privateKey,
         }));
         
+        this.reconnectAttempts = 0;
+        this.startHeartbeat();
         resolve();
       };
 
@@ -175,10 +183,16 @@ export class SSHTerminal {
       };
 
       this.ws.onclose = (event) => {
+        this.stopHeartbeat();
         this.terminal.writeln(
           `\x1b[33m[*] Connection closed (code=${event.code})\x1b[0m`
         );
         document.getElementById('term-status')!.innerHTML = '<div class="w-2 h-2 bg-red-500"></div> Disconnected';
+        document.getElementById('status-text')!.innerHTML = '<span class="w-2 h-2 bg-[#353534] inline-block"></span> STATUS: OFFLINE';
+        
+        if (event.code !== 1000 && this.lastConfig && this.reconnectAttempts < this.maxReconnectAttempts) {
+          this.scheduleReconnect();
+        }
       };
 
       this.ws.onerror = () => {
@@ -212,10 +226,53 @@ export class SSHTerminal {
     this.fitAddon.fit();
   }
 
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+    this.heartbeatInterval = setInterval(() => {
+      if (this.ws?.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify({ type: 'ping' }));
+      }
+    }, 30000);
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+    }
+  }
+
+  private scheduleReconnect(): void {
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+    }
+    
+    this.reconnectAttempts++;
+    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
+    
+    this.terminal.writeln(`\x1b[33m[*] Reconnecting in ${delay / 1000}s (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})...\x1b[0m`);
+    
+    this.reconnectTimeout = setTimeout(async () => {
+      if (this.lastConfig) {
+        this.terminal.writeln('\x1b[32m[+] Reconnecting...\x1b[0m');
+        try {
+          await this.connect(this.lastConfig);
+        } catch (e) {
+          this.terminal.writeln('\x1b[31m[!] Reconnect failed\x1b[0m');
+        }
+      }
+    }, delay);
+  }
+
   disconnect(): void {
-    this.ws?.close();
+    this.stopHeartbeat();
+    if (this.reconnectTimeout) {
+      clearTimeout(this.reconnectTimeout);
+      this.reconnectTimeout = null;
+    }
+    this.reconnectAttempts = this.maxReconnectAttempts;
+    this.ws?.close(1000);
     this.ws = null;
-    // Clean up event listeners to prevent duplicates on reconnect
     this.disposables.forEach(d => d.dispose());
     this.disposables = [];
   }
